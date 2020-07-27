@@ -27,6 +27,7 @@ _testmain.go
 *.test
 *.prof
 
+vendor
 tags
 bin/
 /pkg/
