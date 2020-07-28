@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	ldevices "github.com/opencontainers/runc/libcontainer/devices"
 	lxc "gopkg.in/lxc/go-lxc.v2"
@@ -141,6 +142,12 @@ func (d *Driver) mountVolumes(c *lxc.Container, cfg *drivers.TaskConfig, taskCon
 // mountEntries compute the mount entries to be set on the container
 func (d *Driver) mountEntries(cfg *drivers.TaskConfig, taskConfig TaskConfig) ([]string, error) {
 	// Bind mount the shared alloc dir and task local dir in the container
+	d.logger.Debug("taskenv directories",
+		"local", cfg.Env[taskenv.TaskLocalDir],
+		"alloc", cfg.Env[taskenv.AllocDir],
+		"secret", cfg.Env[taskenv.SecretsDir],
+	)
+
 	mounts := []string{
 		fmt.Sprintf("%s local none rw,bind,create=dir", cfg.TaskDir().LocalDir),
 		fmt.Sprintf("%s alloc none rw,bind,create=dir", cfg.TaskDir().SharedAllocDir),

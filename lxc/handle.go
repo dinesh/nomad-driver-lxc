@@ -3,6 +3,7 @@ package lxc
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,7 +18,9 @@ import (
 type taskHandle struct {
 	container *lxc.Container
 	initPid   int
+	command   []string
 	logger    hclog.Logger
+	driver    *Driver
 
 	totalCpuStats  *stats.CpuStats
 	userCpuStats   *stats.CpuStats
@@ -60,6 +63,93 @@ func (h *taskHandle) IsRunning() bool {
 	h.stateLock.RLock()
 	defer h.stateLock.RUnlock()
 	return h.procState == drivers.TaskStateRunning
+}
+
+func (h *taskHandle) waitForCommand() error {
+	if len(h.command) == 0 {
+		h.logger.Debug("No command/args found, will wait for lxc-init process")
+		h.run()
+		return nil
+	}
+
+	h.logger.Info("Attaching to container", "command", h.command)
+	options := lxc.DefaultAttachOptions
+
+	stdout, err := os.Open(h.taskConfig.StdoutPath)
+	if err != nil {
+		return err
+	}
+	defer stdout.Close()
+
+	stderr, err := os.Open(h.taskConfig.StderrPath)
+	if err != nil {
+		return err
+	}
+	defer stderr.Close()
+
+	options.StdoutFd = stdout.Fd()
+	options.StderrFd = stderr.Fd()
+	options.Env = h.taskConfig.EnvList()
+
+	_, err = h.container.RunCommandStatus(h.command, lxc.AttachOptions{})
+	return err
+}
+
+func (h *taskHandle) waitForInit() error {
+	var (
+		timeout = time.After(10 * time.Second)
+		tick    = time.Tick(500 * time.Millisecond)
+	)
+
+	for {
+		select {
+		case <-h.driver.ctx.Done():
+			h.logger.Info("Main Context cancelled, Existing ...")
+			return nil
+		case <-timeout:
+			h.logger.Info("timed out, Exiting loop", "timeout", timeout)
+			return fmt.Errorf("timed out for condition")
+		case <-tick:
+			if h.container.Running() {
+				h.logger.Info("lxc-init is running")
+				return nil
+			}
+		}
+	}
+}
+
+func (h *taskHandle) runNext() {
+	h.logger.Debug("Monitoring container")
+
+	cleanup := func() {
+		h.logger.Debug("Container monitor exits")
+	}
+	defer cleanup()
+
+	err := h.waitForInit()
+	if err == nil {
+		if err = h.waitForCommand(); err != nil {
+			h.logger.Error("Command failed", "err", err)
+		} else {
+			h.logger.Error("Command succeeded")
+		}
+	} else {
+		h.logger.Error("LXC init failed", "err", err)
+	}
+
+	h.stateLock.Lock()
+
+	if err != nil {
+		h.exitResult.Err = fmt.Errorf("Exit err: %v", err)
+		h.exitResult.ExitCode = 1
+	} else {
+		h.exitResult.Signal = 0
+		h.exitResult.ExitCode = 0
+	}
+	h.completedAt = time.Now()
+
+	h.procState = drivers.TaskStateExited
+	h.stateLock.Unlock()
 }
 
 func (h *taskHandle) run() {

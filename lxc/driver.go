@@ -3,6 +3,7 @@ package lxc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -83,6 +84,9 @@ var (
 		"verbosity":      hclspec.NewAttr("verbosity", "string", false),
 		"volumes":        hclspec.NewAttr("volumes", "list(string)", false),
 		"network_mode":   hclspec.NewAttr("network_mode", "string", false),
+		"parameters":     hclspec.NewAttr("parameters", "list(string)", false),
+		"command":        hclspec.NewAttr("command", "string", false),
+		"args":           hclspec.NewAttr("args", "list(string)", false),
 	})
 
 	// capabilities is returned by the Capabilities RPC and indicates what
@@ -159,6 +163,9 @@ type TaskConfig struct {
 	Verbosity            string   `codec:"verbosity"`
 	Volumes              []string `codec:"volumes"`
 	NetworkMode          string   `codec:"network_mode"`
+	Parameters           []string `codec:"parameters"`
+	Command              string   `codec:"command"`
+	Args                 []string `codec:"args"`
 }
 
 // TaskState is the state which is encoded in the handle returned in
@@ -313,6 +320,7 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	d.tasks.Set(taskState.TaskConfig.ID, h)
 
 	go h.run()
+
 	return nil
 }
 
@@ -326,6 +334,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, fmt.Errorf("failed to decode driver config: %v", err)
 	}
 
+	if driverConfig.Command == "" && len(driverConfig.Args) > 0 {
+		return nil, nil, fmt.Errorf(
+			"`config.command` must be set with args(%d provided)",
+			len(driverConfig.Args),
+		)
+	}
+
 	d.logger.Info("starting lxc task", "driver_cfg", hclog.Fmt("%+v", driverConfig))
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
@@ -333,6 +348,19 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	c, err := d.initializeContainer(cfg, driverConfig)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	for _, line := range driverConfig.Parameters {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) < 2 {
+			d.logger.Warn("Incorrect parameter. (missing `=` char)", line)
+			continue
+		}
+		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if err := c.SetConfigItem(key, value); err != nil {
+			d.logger.Debug(fmt.Sprintf("setting config item %s=%s", key, value))
+			return nil, nil, fmt.Errorf("unable to apply config item(%s=%s): %v", key, value, err)
+		}
 	}
 
 	opt := toLXCCreateOptions(driverConfig)
@@ -366,10 +394,16 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, err
 	}
 
-	pid := c.InitPid()
+	var (
+		pid           = c.InitPid()
+		containerID   = c.Name()
+		waitIpTimeout = 2 * time.Second
+	)
 
+	d.logger = d.logger.With("container", containerID)
 	h := &taskHandle{
 		container:  c,
+		driver:     d,
 		initPid:    pid,
 		taskConfig: cfg,
 		procState:  drivers.TaskStateRunning,
@@ -381,21 +415,37 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		systemCpuStats: stats.NewCpuStats(),
 	}
 
+	if driverConfig.Command != "" {
+		h.command = append(h.command, driverConfig.Command)
+		h.command = append(h.command, driverConfig.Args...)
+	}
+
+	ips, err := c.WaitIPAddresses(waitIpTimeout)
+	if err != nil {
+		if err != lxc.ErrIPAddresses {
+			d.logger.Info(fmt.Sprintf("No IPAddress allocated (timeout: %v)", waitIpTimeout))
+		} else {
+			d.logger.Error(err.Error())
+		}
+	}
+
 	driverState := TaskState{
-		ContainerName: c.Name(),
+		ContainerName: containerID,
 		TaskConfig:    cfg,
 		StartedAt:     h.startedAt,
 	}
 
 	if err := handle.SetDriverState(&driverState); err != nil {
-		d.logger.Error("failed to start task, error setting driver state", "error", err)
+		d.logger.Error("failed to start task, error setting driver state", "err", err)
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
 
 	d.tasks.Set(cfg.ID, h)
 
-	go h.run()
+	go h.runNext()
+
+	d.logger.Info("Completely started container", "taskID", cfg.ID, "ips", ips)
 
 	return handle, nil, nil
 }
