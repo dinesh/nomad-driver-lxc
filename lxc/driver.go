@@ -92,7 +92,7 @@ var (
 	// capabilities is returned by the Capabilities RPC and indicates what
 	// optional features this driver supports
 	capabilities = &drivers.Capabilities{
-		SendSignals: false,
+		SendSignals: true,
 		Exec:        false,
 		FSIsolation: drivers.FSIsolationImage,
 	}
@@ -311,6 +311,7 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 		startedAt:  taskState.StartedAt,
 		exitResult: &drivers.ExitResult{},
 		logger:     d.logger,
+		doneCh:     make(chan bool),
 
 		totalCpuStats:  stats.NewCpuStats(),
 		userCpuStats:   stats.NewCpuStats(),
@@ -319,8 +320,8 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 
 	d.tasks.Set(taskState.TaskConfig.ID, h)
 
-	go h.run()
-
+	h.logger.Info("Recovered task", "taskID", taskState.TaskConfig.ID)
+	go h.runNext()
 	return nil
 }
 
@@ -395,9 +396,9 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	}
 
 	var (
-		pid           = c.InitPid()
-		containerID   = c.Name()
-		waitIpTimeout = 2 * time.Second
+		pid         = c.InitPid()
+		containerID = c.Name()
+		// waitIpTimeout = 3 * time.Second
 	)
 
 	d.logger = d.logger.With("container", containerID)
@@ -409,6 +410,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		procState:  drivers.TaskStateRunning,
 		startedAt:  time.Now().Round(time.Millisecond),
 		logger:     d.logger,
+		doneCh:     make(chan bool),
 
 		totalCpuStats:  stats.NewCpuStats(),
 		userCpuStats:   stats.NewCpuStats(),
@@ -420,14 +422,16 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		h.command = append(h.command, driverConfig.Args...)
 	}
 
-	ips, err := c.WaitIPAddresses(waitIpTimeout)
-	if err != nil {
-		if err != lxc.ErrIPAddresses {
-			d.logger.Info(fmt.Sprintf("No IPAddress allocated (timeout: %v)", waitIpTimeout))
-		} else {
-			d.logger.Error(err.Error())
+	/*
+		ips, err := c.WaitIPAddresses(waitIpTimeout)
+		if err != nil {
+			if err != lxc.ErrIPAddresses {
+				d.logger.Info(fmt.Sprintf("No IPAddress allocated (timeout: %v)", waitIpTimeout))
+			} else {
+				d.logger.Error(err.Error())
+			}
 		}
-	}
+	*/
 
 	driverState := TaskState{
 		ContainerName: containerID,
@@ -445,8 +449,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	go h.runNext()
 
-	d.logger.Info("Completely started container", "taskID", cfg.ID, "ips", ips)
-
+	d.logger.Info("Completely started container", "taskID", cfg.ID)
 	return handle, nil, nil
 }
 
@@ -475,7 +478,7 @@ func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *dr
 	//     any other calls, including stats.
 	//
 	// Going with simplest approach of polling for handler to mark exit.
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -498,7 +501,7 @@ func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) e
 	if !ok {
 		return drivers.ErrTaskNotFound
 	}
-
+	handle.logger.Info("Got StopTask hook", "signal", signal, "timeout", timeout)
 	if err := handle.shutdown(timeout); err != nil {
 		return fmt.Errorf("executor Shutdown failed: %v", err)
 	}

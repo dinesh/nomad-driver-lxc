@@ -28,6 +28,7 @@ func (d *Driver) recoverPre09Task(h *drivers.TaskHandle) error {
 		procState:  drivers.TaskStateRunning,
 		exitResult: &drivers.ExitResult{},
 		logger:     d.logger,
+		doneCh:     make(chan bool),
 
 		totalCpuStats:  stats.NewCpuStats(),
 		userCpuStats:   stats.NewCpuStats(),
@@ -36,6 +37,6 @@ func (d *Driver) recoverPre09Task(h *drivers.TaskHandle) error {
 
 	d.tasks.Set(h.Config.ID, th)
 
-	go th.run()
+	go th.runNext()
 	return nil
 }

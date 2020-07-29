@@ -1,7 +1,6 @@
 package lxc
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,8 +9,10 @@ import (
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/lib/fifo"
 	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/pkg/errors"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 )
 
@@ -28,6 +29,7 @@ type taskHandle struct {
 
 	// stateLock syncs access to all fields below
 	stateLock sync.RWMutex
+	doneCh    chan bool
 
 	taskConfig  *drivers.TaskConfig
 	procState   drivers.TaskState
@@ -68,30 +70,56 @@ func (h *taskHandle) IsRunning() bool {
 func (h *taskHandle) waitForCommand() error {
 	if len(h.command) == 0 {
 		h.logger.Debug("No command/args found, will wait for lxc-init process")
-		h.run()
+		h.waitTillStopped()
 		return nil
 	}
 
-	h.logger.Info("Attaching to container", "command", h.command)
+	stopInitProcess := func() {
+		h.logger.Info("stopping container")
+		if serr := h.container.Stop(); serr != nil {
+			h.logger.Error("stopping lxc-init", "err", serr)
+		}
+	}
+	defer stopInitProcess()
+
 	options := lxc.DefaultAttachOptions
+	h.logger.Debug("setting attach options",
+		"command", h.command,
+	)
 
-	stdout, err := os.Open(h.taskConfig.StdoutPath)
+	stdout, err := fifo.OpenWriter(h.taskConfig.StdoutPath)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "fifo.OpenWriter stdout")
 	}
-	defer stdout.Close()
-
-	stderr, err := os.Open(h.taskConfig.StderrPath)
+	stderr, err := fifo.OpenWriter(h.taskConfig.StderrPath)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "fifo.OpenWriter stderr")
 	}
-	defer stderr.Close()
 
-	options.StdoutFd = stdout.Fd()
-	options.StderrFd = stderr.Fd()
+	outr, outw, _ := os.Pipe()
+	errr, errw, _ := os.Pipe()
+
+	go asyncCopy(stdout, outr)
+	go asyncCopy(stderr, errr)
+
+	options.StdoutFd = outw.Fd()
+	options.StderrFd = errw.Fd()
+
 	options.Env = h.taskConfig.EnvList()
+	options.ClearEnv = true
 
-	_, err = h.container.RunCommandStatus(h.command, lxc.AttachOptions{})
+	h.logger.Info("Attaching to container", "command", h.command)
+	_, err = h.container.RunCommand(h.command, options)
+
+	{
+		outr.Close()
+		errr.Close()
+		stdout.Close()
+		stderr.Close()
+	}
+
+	h.logger.Debug("Command execution finished")
+
 	return err
 }
 
@@ -124,18 +152,31 @@ func (h *taskHandle) runNext() {
 	cleanup := func() {
 		h.logger.Debug("Container monitor exits")
 	}
+
 	defer cleanup()
+
+	h.stateLock.Lock()
+	if h.exitResult == nil {
+		h.exitResult = &drivers.ExitResult{}
+	}
+	h.stateLock.Unlock()
 
 	err := h.waitForInit()
 	if err == nil {
 		if err = h.waitForCommand(); err != nil {
 			h.logger.Error("Command failed", "err", err)
-		} else {
-			h.logger.Error("Command succeeded")
 		}
 	} else {
 		h.logger.Error("LXC init failed", "err", err)
 	}
+
+	// Shutdown stats collection
+	close(h.doneCh)
+
+	// Wait till container stops
+	h.waitTillStopped()
+
+	h.logger.Debug("Container stopped")
 
 	h.stateLock.Lock()
 
@@ -152,147 +193,11 @@ func (h *taskHandle) runNext() {
 	h.stateLock.Unlock()
 }
 
-func (h *taskHandle) run() {
-	h.stateLock.Lock()
-	if h.exitResult == nil {
-		h.exitResult = &drivers.ExitResult{}
-	}
-	h.stateLock.Unlock()
-
+func (h *taskHandle) waitTillStopped() {
 	if ok, err := waitTillStopped(h.container); !ok {
 		h.logger.Error("failed to find container process", "error", err)
 		return
 	}
-
-	h.stateLock.Lock()
-	defer h.stateLock.Unlock()
-
-	h.procState = drivers.TaskStateExited
-	h.exitResult.ExitCode = 0
-	h.exitResult.Signal = 0
-	h.completedAt = time.Now()
-
-	// TODO: detect if the task OOMed
-}
-
-func (h *taskHandle) stats(ctx context.Context, interval time.Duration) (<-chan *drivers.TaskResourceUsage, error) {
-	ch := make(chan *drivers.TaskResourceUsage)
-	go h.handleStats(ctx, ch, interval)
-	return ch, nil
-}
-
-func (h *taskHandle) handleStats(ctx context.Context, ch chan *drivers.TaskResourceUsage, interval time.Duration) {
-	defer close(ch)
-	timer := time.NewTimer(0)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-timer.C:
-			timer.Reset(interval)
-		}
-		cpuStats, err := h.container.CPUStats()
-		if err != nil {
-			h.logger.Error("failed to get container cpu stats", "error", err)
-			return
-		}
-		total, err := h.container.CPUTime()
-		if err != nil {
-			h.logger.Error("failed to get container cpu time", "error", err)
-			return
-		}
-
-		t := time.Now()
-
-		// Get the cpu stats
-		system := cpuStats["system"]
-		user := cpuStats["user"]
-		cs := &drivers.CpuStats{
-			SystemMode: h.systemCpuStats.Percent(float64(system)),
-			UserMode:   h.systemCpuStats.Percent(float64(user)),
-			Percent:    h.totalCpuStats.Percent(float64(total)),
-			TotalTicks: float64(user + system),
-			Measured:   LXCMeasuredCpuStats,
-		}
-
-		// Get the Memory Stats
-		memData := map[string]uint64{
-			"rss":   0,
-			"cache": 0,
-			"swap":  0,
-		}
-		rawMemStats := h.container.CgroupItem("memory.stat")
-		for _, rawMemStat := range rawMemStats {
-			key, val, err := keysToVal(rawMemStat)
-			if err != nil {
-				h.logger.Error("failed to get stat", "line", rawMemStat, "error", err)
-				continue
-			}
-			if _, ok := memData[key]; ok {
-				memData[key] = val
-
-			}
-		}
-		ms := &drivers.MemoryStats{
-			RSS:      memData["rss"],
-			Cache:    memData["cache"],
-			Swap:     memData["swap"],
-			Measured: LXCMeasuredMemStats,
-		}
-
-		mu := h.container.CgroupItem("memory.max_usage_in_bytes")
-		for _, rawMemMaxUsage := range mu {
-			val, err := strconv.ParseUint(rawMemMaxUsage, 10, 64)
-			if err != nil {
-				h.logger.Error("failed to get max memory usage", "error", err)
-				continue
-			}
-			ms.MaxUsage = val
-		}
-		ku := h.container.CgroupItem("memory.kmem.usage_in_bytes")
-		for _, rawKernelUsage := range ku {
-			val, err := strconv.ParseUint(rawKernelUsage, 10, 64)
-			if err != nil {
-				h.logger.Error("failed to get kernel memory usage", "error", err)
-				continue
-			}
-			ms.KernelUsage = val
-		}
-
-		mku := h.container.CgroupItem("memory.kmem.max_usage_in_bytes")
-		for _, rawMaxKernelUsage := range mku {
-			val, err := strconv.ParseUint(rawMaxKernelUsage, 10, 64)
-			if err != nil {
-				h.logger.Error("failed tog get max kernel memory usage", "error", err)
-				continue
-			}
-			ms.KernelMaxUsage = val
-		}
-
-		taskResUsage := drivers.TaskResourceUsage{
-			ResourceUsage: &drivers.ResourceUsage{
-				CpuStats:    cs,
-				MemoryStats: ms,
-			},
-			Timestamp: t.UTC().UnixNano(),
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case ch <- &taskResUsage:
-		}
-	}
-}
-
-func keysToVal(line string) (string, uint64, error) {
-	tokens := strings.Split(line, " ")
-	if len(tokens) != 2 {
-		return "", 0, fmt.Errorf("line isn't a k/v pair")
-	}
-	key := tokens[0]
-	val, err := strconv.ParseUint(tokens[1], 10, 64)
-	return key, val, err
 }
 
 // shutdown shuts down the container, with `timeout` grace period
