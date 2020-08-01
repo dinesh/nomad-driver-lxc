@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/appscode/go/wait"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/lib/fifo"
 	"github.com/hashicorp/nomad/client/stats"
@@ -16,12 +17,17 @@ import (
 	lxc "gopkg.in/lxc/go-lxc.v2"
 )
 
-type taskHandle struct {
+type ContainerInfo struct {
 	container *lxc.Container
 	initPid   int
 	command   []string
-	logger    hclog.Logger
-	driver    *Driver
+}
+
+type taskHandle struct {
+	ContainerInfo
+
+	logger hclog.Logger
+	driver *Driver
 
 	totalCpuStats  *stats.CpuStats
 	userCpuStats   *stats.CpuStats
@@ -42,6 +48,8 @@ var (
 	LXCMeasuredCpuStats = []string{"System Mode", "User Mode", "Percent"}
 
 	LXCMeasuredMemStats = []string{"RSS", "Cache", "Swap", "Max Usage", "Kernel Usage", "Kernel Max Usage"}
+
+	AttachmentMode = true
 )
 
 func (h *taskHandle) TaskStatus() *drivers.TaskStatus {
@@ -67,11 +75,11 @@ func (h *taskHandle) IsRunning() bool {
 	return h.procState == drivers.TaskStateRunning
 }
 
-func (h *taskHandle) waitForCommand() error {
+func (h *taskHandle) waitForCommand() (int, error) {
 	if len(h.command) == 0 {
 		h.logger.Debug("No command/args found, will wait for lxc-init process")
 		h.waitTillStopped()
-		return nil
+		return 0, nil
 	}
 
 	stopInitProcess := func() {
@@ -89,11 +97,11 @@ func (h *taskHandle) waitForCommand() error {
 
 	stdout, err := fifo.OpenWriter(h.taskConfig.StdoutPath)
 	if err != nil {
-		return errors.Wrap(err, "fifo.OpenWriter stdout")
+		return 0, errors.Wrap(err, "fifo.OpenWriter stdout")
 	}
 	stderr, err := fifo.OpenWriter(h.taskConfig.StderrPath)
 	if err != nil {
-		return errors.Wrap(err, "fifo.OpenWriter stderr")
+		return 0, errors.Wrap(err, "fifo.OpenWriter stderr")
 	}
 
 	outr, outw, _ := os.Pipe()
@@ -104,12 +112,12 @@ func (h *taskHandle) waitForCommand() error {
 
 	options.StdoutFd = outw.Fd()
 	options.StderrFd = errw.Fd()
-
 	options.Env = h.taskConfig.EnvList()
-	options.ClearEnv = true
 
 	h.logger.Info("Attaching to container", "command", h.command)
-	_, err = h.container.RunCommand(h.command, options)
+
+	now := time.Now()
+	exitCode, err := h.container.RunCommandStatus(h.command, options)
 
 	{
 		outr.Close()
@@ -118,9 +126,32 @@ func (h *taskHandle) waitForCommand() error {
 		stderr.Close()
 	}
 
-	h.logger.Debug("Command execution finished")
+	h.logger.Debug(fmt.Sprintf("Command execution with %d in %s",
+		exitCode, time.Now().Sub(now).String()))
 
-	return err
+	return exitCode, err
+}
+
+func (h *taskHandle) waitForNetwork() {
+	backoff := wait.Backoff{
+		Steps:    10,
+		Duration: 500 * time.Millisecond,
+		Factor:   1,
+	}
+	now := time.Now()
+
+	var ips []string
+	if err := wait.ExponentialBackoff(backoff, func() (done bool, err error) {
+		ips, err = h.container.IPAddresses()
+		done = len(ips) > 0
+		err = nil
+		return
+	}); err != nil {
+		h.logger.Warn(fmt.Sprintf("timed-out %v", err))
+		return
+	}
+
+	h.logger.Debug(fmt.Sprintf("Allocated IPAddress(s) %v in %s", ips, time.Now().Sub(now).String()))
 }
 
 func (h *taskHandle) waitForInit() error {
@@ -128,6 +159,11 @@ func (h *taskHandle) waitForInit() error {
 		timeout = time.After(10 * time.Second)
 		tick    = time.Tick(500 * time.Millisecond)
 	)
+
+	if !h.container.Running() {
+		h.logger.Warn("Container not running", "state", h.container.State())
+		return nil
+	}
 
 	for {
 		select {
@@ -139,7 +175,6 @@ func (h *taskHandle) waitForInit() error {
 			return fmt.Errorf("timed out for condition")
 		case <-tick:
 			if h.container.Running() {
-				h.logger.Info("lxc-init is running")
 				return nil
 			}
 		}
@@ -147,27 +182,23 @@ func (h *taskHandle) waitForInit() error {
 }
 
 func (h *taskHandle) runNext() {
-	h.logger.Debug("Monitoring container")
-
-	cleanup := func() {
-		h.logger.Debug("Container monitor exits")
-	}
-
-	defer cleanup()
-
 	h.stateLock.Lock()
 	if h.exitResult == nil {
 		h.exitResult = &drivers.ExitResult{}
 	}
 	h.stateLock.Unlock()
+	var err error
+	var exitCode int
 
-	err := h.waitForInit()
-	if err == nil {
-		if err = h.waitForCommand(); err != nil {
-			h.logger.Error("Command failed", "err", err)
+	if AttachmentMode {
+		err = h.waitForInit()
+		if err == nil {
+			if exitCode, err = h.waitForCommand(); err != nil {
+				h.logger.Error("Command failed", "err", err)
+			}
+		} else {
+			h.logger.Error("LXC init failed", "err", err)
 		}
-	} else {
-		h.logger.Error("LXC init failed", "err", err)
 	}
 
 	// Shutdown stats collection
@@ -176,16 +207,14 @@ func (h *taskHandle) runNext() {
 	// Wait till container stops
 	h.waitTillStopped()
 
-	h.logger.Debug("Container stopped")
-
 	h.stateLock.Lock()
 
 	if err != nil {
-		h.exitResult.Err = fmt.Errorf("Exit err: %v", err)
+		h.exitResult.Err = err
 		h.exitResult.ExitCode = 1
 	} else {
 		h.exitResult.Signal = 0
-		h.exitResult.ExitCode = 0
+		h.exitResult.ExitCode = exitCode
 	}
 	h.completedAt = time.Now()
 

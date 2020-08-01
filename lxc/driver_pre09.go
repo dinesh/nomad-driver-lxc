@@ -22,8 +22,10 @@ func (d *Driver) recoverPre09Task(h *drivers.TaskHandle) error {
 
 	initPid := c.InitPid()
 	th := &taskHandle{
-		container:  c,
-		initPid:    initPid,
+		ContainerInfo: ContainerInfo{
+			container: c,
+			initPid:   initPid,
+		},
 		taskConfig: h.Config,
 		procState:  drivers.TaskStateRunning,
 		exitResult: &drivers.ExitResult{},

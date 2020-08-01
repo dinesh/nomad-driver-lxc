@@ -12,7 +12,7 @@ import (
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
-	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
+	"github.com/tevino/abool"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 )
 
@@ -26,6 +26,13 @@ const (
 	// taskHandleVersion is the version of task handle which this driver sets
 	// and understands how to decode driver state
 	taskHandleVersion = 1
+
+	// ipAddressInterval is the interval to wait for a container to get IP4 Address
+	ipAddressInterval = 10 * time.Second
+
+	danglingContainersCreationGraceMinimum = 1 * time.Minute
+
+	providerEnvVar = "PROVIDER=lxc-driver"
 )
 
 var (
@@ -36,58 +43,6 @@ var (
 		PluginVersion:     "0.1.1-dev",
 		Name:              pluginName,
 	}
-
-	// configSpec is the hcl specification returned by the ConfigSchema RPC
-	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"enabled": hclspec.NewDefault(
-			hclspec.NewAttr("enabled", "bool", false),
-			hclspec.NewLiteral("true"),
-		),
-		"volumes_enabled": hclspec.NewDefault(
-			hclspec.NewAttr("volumes_enabled", "bool", false),
-			hclspec.NewLiteral("true"),
-		),
-		"lxc_path": hclspec.NewAttr("lxc_path", "string", false),
-		"network_mode": hclspec.NewDefault(
-			hclspec.NewAttr("network_mode", "string", false),
-			hclspec.NewLiteral("\"bridge\""),
-		),
-		// garbage collection options
-		// default needed for both if the gc {...} block is not set and
-		// if the default fields are missing
-		"gc": hclspec.NewDefault(hclspec.NewBlock("gc", false, hclspec.NewObject(map[string]*hclspec.Spec{
-			"container": hclspec.NewDefault(
-				hclspec.NewAttr("container", "bool", false),
-				hclspec.NewLiteral("true"),
-			),
-		})), hclspec.NewLiteral(`{
-			container = true
-		}`)),
-	})
-
-	// taskConfigSpec is the hcl specification for the driver config section of
-	// a task within a job. It is returned in the TaskConfigSchema RPC
-	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"template":       hclspec.NewAttr("template", "string", true),
-		"distro":         hclspec.NewAttr("distro", "string", false),
-		"release":        hclspec.NewAttr("release", "string", false),
-		"arch":           hclspec.NewAttr("arch", "string", false),
-		"image_variant":  hclspec.NewAttr("image_variant", "string", false),
-		"image_server":   hclspec.NewAttr("image_server", "string", false),
-		"gpg_key_id":     hclspec.NewAttr("gpg_key_id", "string", false),
-		"gpg_key_server": hclspec.NewAttr("gpg_key_server", "string", false),
-		"disable_gpg":    hclspec.NewAttr("disable_gpg", "string", false),
-		"flush_cache":    hclspec.NewAttr("flush_cache", "string", false),
-		"force_cache":    hclspec.NewAttr("force_cache", "string", false),
-		"template_args":  hclspec.NewAttr("template_args", "list(string)", false),
-		"log_level":      hclspec.NewAttr("log_level", "string", false),
-		"verbosity":      hclspec.NewAttr("verbosity", "string", false),
-		"volumes":        hclspec.NewAttr("volumes", "list(string)", false),
-		"network_mode":   hclspec.NewAttr("network_mode", "string", false),
-		"parameters":     hclspec.NewAttr("parameters", "list(string)", false),
-		"command":        hclspec.NewAttr("command", "string", false),
-		"args":           hclspec.NewAttr("args", "list(string)", false),
-	})
 
 	// capabilities is returned by the Capabilities RPC and indicates what
 	// optional features this driver supports
@@ -123,11 +78,40 @@ type Driver struct {
 
 	// logger will log to the Nomad agent
 	logger hclog.Logger
+
+	reconciler *containerReconciler
+
+	// A tri-state boolean to know if the fingerprinting has happened and
+	// whether it has been successful
+	fingerprint *abool.AtomicBool
+}
+
+// ContainerGCConfig controls the behavior of the GC reconciler to detects
+// dangling nomad containers that aren't tracked due to lxc/nomad bugs
+type ContainerGCConfig struct {
+	// Enabled controls whether container reconciler is enabled
+	Enabled bool `codec:"enabled"`
+
+	// DryRun indicates that reconciler should log unexpectedly running containers
+	// if found without actually killing them
+	DryRun bool `codec:"dry_run"`
+
+	// PeriodStr controls the frequency of scanning containers
+	PeriodStr string        `codec:"period"`
+	period    time.Duration `codec:"-"`
+
+	// CreationGraceStr is the duration allowed for a newly created container
+	// to live without being registered as a running task in nomad.
+	// A container is treated as leaked if it lived more than grace duration
+	// and haven't been registered in tasks.
+	CreationGraceStr string        `codec:"creation_grace"`
+	CreationGrace    time.Duration `codec:"-"`
 }
 
 // GCConfig is the driver GarbageCollection configuration
 type GCConfig struct {
-	Container bool `codec:"container"`
+	Container          bool              `codec:"container"`
+	DanglingContainers ContainerGCConfig `codec:"dangling_containers"`
 }
 
 // Config is the driver configuration set by the SetConfig RPC call
@@ -186,6 +170,7 @@ func NewLXCDriver(logger hclog.Logger) drivers.DriverPlugin {
 		config:         &Config{},
 		tasks:          newTaskStore(),
 		ctx:            ctx,
+		fingerprint:    abool.New(),
 		signalShutdown: cancel,
 		logger:         logger,
 	}
@@ -207,10 +192,31 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 		}
 	}
 
+	if len(config.GC.DanglingContainers.PeriodStr) > 0 {
+		dur, err := time.ParseDuration(config.GC.DanglingContainers.PeriodStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse 'period' duration: %v", err)
+		}
+		config.GC.DanglingContainers.period = dur
+	}
+
+	if len(config.GC.DanglingContainers.CreationGraceStr) > 0 {
+		dur, err := time.ParseDuration(config.GC.DanglingContainers.CreationGraceStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse 'creation_grace' duration: %v", err)
+		}
+		if dur < danglingContainersCreationGraceMinimum {
+			return fmt.Errorf("creation_grace is less than minimum, %v", danglingContainersCreationGraceMinimum)
+		}
+		config.GC.DanglingContainers.CreationGrace = dur
+	}
+
 	d.config = &config
 	if cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
 	}
+
+	d.reconciler = newReconciler(d)
 
 	return nil
 }
@@ -226,56 +232,6 @@ func (d *Driver) TaskConfigSchema() (*hclspec.Spec, error) {
 
 func (d *Driver) Capabilities() (*drivers.Capabilities, error) {
 	return capabilities, nil
-}
-
-func (d *Driver) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprint, error) {
-	ch := make(chan *drivers.Fingerprint)
-	go d.handleFingerprint(ctx, ch)
-	return ch, nil
-}
-
-func (d *Driver) handleFingerprint(ctx context.Context, ch chan<- *drivers.Fingerprint) {
-	defer close(ch)
-	ticker := time.NewTimer(0)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-d.ctx.Done():
-			return
-		case <-ticker.C:
-			ticker.Reset(fingerprintPeriod)
-			ch <- d.buildFingerprint()
-		}
-	}
-}
-
-func (d *Driver) buildFingerprint() *drivers.Fingerprint {
-	var health drivers.HealthState
-	var desc string
-	attrs := map[string]*pstructs.Attribute{}
-
-	lxcVersion := lxc.Version()
-
-	if d.config.Enabled && lxcVersion != "" {
-		health = drivers.HealthStateHealthy
-		desc = "ready"
-		attrs["driver.lxc"] = pstructs.NewBoolAttribute(true)
-		attrs["driver.lxc.version"] = pstructs.NewStringAttribute(lxcVersion)
-	} else {
-		health = drivers.HealthStateUndetected
-		desc = "disabled"
-	}
-
-	if d.config.AllowVolumes {
-		attrs["driver.lxc.volumes.enabled"] = pstructs.NewBoolAttribute(true)
-	}
-
-	return &drivers.Fingerprint{
-		Attributes:        attrs,
-		Health:            health,
-		HealthDescription: desc,
-	}
 }
 
 func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
@@ -299,18 +255,23 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 
 	c, err := lxc.NewContainer(taskState.ContainerName, d.lxcPath())
 	if err != nil {
-		return fmt.Errorf("failed to create container ref: %v", err)
+		return fmt.Errorf("failed to create co	ntainer ref: %v", err)
 	}
 
 	initPid := c.InitPid()
+	logger := d.logger.With("container", c.Name())
+
 	h := &taskHandle{
-		container:  c,
-		initPid:    initPid,
+		ContainerInfo: ContainerInfo{
+			container: c,
+			initPid:   initPid,
+		},
+		driver:     d,
 		taskConfig: taskState.TaskConfig,
 		procState:  drivers.TaskStateRunning,
 		startedAt:  taskState.StartedAt,
 		exitResult: &drivers.ExitResult{},
-		logger:     d.logger,
+		logger:     logger,
 		doneCh:     make(chan bool),
 
 		totalCpuStats:  stats.NewCpuStats(),
@@ -385,9 +346,24 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		return nil, nil, err
 	}
 
-	if err := c.Start(); err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("unable to start container: %v", err)
+	var command []string
+	if driverConfig.Command != "" {
+		command = append(command, driverConfig.Command)
+		command = append(command, driverConfig.Args...)
+	}
+
+	c.SetConfigItem("lxc.environment", providerEnvVar)
+
+	if AttachmentMode {
+		if err := c.Start(); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("unable to start container: %v", err)
+		}
+	} else {
+		if err := c.StartExecute(command); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("unable to start container: %v", err)
+		}
 	}
 
 	if err := d.setResourceLimits(c, cfg); err != nil {
@@ -398,14 +374,16 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	var (
 		pid         = c.InitPid()
 		containerID = c.Name()
-		// waitIpTimeout = 3 * time.Second
 	)
 
 	d.logger = d.logger.With("container", containerID)
 	h := &taskHandle{
-		container:  c,
+		ContainerInfo: ContainerInfo{
+			initPid:   pid,
+			container: c,
+			command:   command,
+		},
 		driver:     d,
-		initPid:    pid,
 		taskConfig: cfg,
 		procState:  drivers.TaskStateRunning,
 		startedAt:  time.Now().Round(time.Millisecond),
@@ -417,27 +395,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		systemCpuStats: stats.NewCpuStats(),
 	}
 
-	if driverConfig.Command != "" {
-		h.command = append(h.command, driverConfig.Command)
-		h.command = append(h.command, driverConfig.Args...)
-	}
-
-	/*
-		ips, err := c.WaitIPAddresses(waitIpTimeout)
-		if err != nil {
-			if err != lxc.ErrIPAddresses {
-				d.logger.Info(fmt.Sprintf("No IPAddress allocated (timeout: %v)", waitIpTimeout))
-			} else {
-				d.logger.Error(err.Error())
-			}
-		}
-	*/
-
 	driverState := TaskState{
 		ContainerName: containerID,
 		TaskConfig:    cfg,
 		StartedAt:     h.startedAt,
 	}
+
+	h.waitForNetwork()
 
 	if err := handle.SetDriverState(&driverState); err != nil {
 		d.logger.Error("failed to start task, error setting driver state", "err", err)
@@ -449,7 +413,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 
 	go h.runNext()
 
-	d.logger.Info("Completely started container", "taskID", cfg.ID)
+	d.logger.Info("Completely started task", "taskID", cfg.ID)
 	return handle, nil, nil
 }
 
@@ -560,7 +524,7 @@ func (d *Driver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, err
 }
 
 func (d *Driver) SignalTask(taskID string, signal string) error {
-	return fmt.Errorf("LXC driver does not support signals")
+	return fmt.Errorf("LXC driver does not support signal")
 }
 
 func (d *Driver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
