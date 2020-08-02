@@ -9,6 +9,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
+	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
@@ -131,25 +132,26 @@ type Config struct {
 
 // TaskConfig is the driver configuration of a task within a job
 type TaskConfig struct {
-	Template             string   `codec:"template"`
-	Distro               string   `codec:"distro"`
-	Release              string   `codec:"release"`
-	Arch                 string   `codec:"arch"`
-	ImageVariant         string   `codec:"image_variant"`
-	ImageServer          string   `codec:"image_server"`
-	GPGKeyID             string   `codec:"gpg_key_id"`
-	GPGKeyServer         string   `codec:"gpg_key_server"`
-	DisableGPGValidation bool     `codec:"disable_gpg"`
-	FlushCache           bool     `codec:"flush_cache"`
-	ForceCache           bool     `codec:"force_cache"`
-	TemplateArgs         []string `codec:"template_args"`
-	LogLevel             string   `codec:"log_level"`
-	Verbosity            string   `codec:"verbosity"`
-	Volumes              []string `codec:"volumes"`
-	NetworkMode          string   `codec:"network_mode"`
-	Parameters           []string `codec:"parameters"`
-	Command              string   `codec:"command"`
-	Args                 []string `codec:"args"`
+	Template             string             `codec:"template"`
+	Distro               string             `codec:"distro"`
+	Release              string             `codec:"release"`
+	Arch                 string             `codec:"arch"`
+	ImageVariant         string             `codec:"image_variant"`
+	ImageServer          string             `codec:"image_server"`
+	GPGKeyID             string             `codec:"gpg_key_id"`
+	GPGKeyServer         string             `codec:"gpg_key_server"`
+	DisableGPGValidation bool               `codec:"disable_gpg"`
+	FlushCache           bool               `codec:"flush_cache"`
+	ForceCache           bool               `codec:"force_cache"`
+	TemplateArgs         []string           `codec:"template_args"`
+	LogLevel             string             `codec:"log_level"`
+	Verbosity            string             `codec:"verbosity"`
+	Volumes              []string           `codec:"volumes"`
+	NetworkMode          string             `codec:"network_mode"`
+	PortMap              hclutils.MapStrInt `codec:"port_map"`
+	Parameters           []string           `codec:"parameters"`
+	Command              string             `codec:"command"`
+	Args                 []string           `codec:"args"`
 }
 
 // TaskState is the state which is encoded in the handle returned in
@@ -336,10 +338,13 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		}
 	}
 
-	if err := d.configureContainerNetwork(c, driverConfig); err != nil {
+	network, err := d.configureContainerNetwork(c, cfg, driverConfig)
+	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
+
+	d.logger.Debug("configured Network", "network", hclog.Fmt("%+v", network))
 
 	if err := d.mountVolumes(c, cfg, driverConfig); err != nil {
 		cleanup()
@@ -351,8 +356,6 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		command = append(command, driverConfig.Command)
 		command = append(command, driverConfig.Args...)
 	}
-
-	c.SetConfigItem("lxc.environment", providerEnvVar)
 
 	if AttachmentMode {
 		if err := c.Start(); err != nil {
@@ -414,7 +417,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 	go h.runNext()
 
 	d.logger.Info("Completely started task", "taskID", cfg.ID)
-	return handle, nil, nil
+	return handle, network, nil
 }
 
 func (d *Driver) WaitTask(ctx context.Context, taskID string) (<-chan *drivers.ExitResult, error) {

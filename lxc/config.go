@@ -82,6 +82,7 @@ var (
 		"verbosity":      hclspec.NewAttr("verbosity", "string", false),
 		"volumes":        hclspec.NewAttr("volumes", "list(string)", false),
 		"network_mode":   hclspec.NewAttr("network_mode", "string", false),
+		"port_map":       hclspec.NewAttr("port_map", "list(map(number))", false),
 		"parameters":     hclspec.NewAttr("parameters", "list(string)", false),
 		"command":        hclspec.NewAttr("command", "string", false),
 		"args":           hclspec.NewAttr("args", "list(string)", false),

@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	ldevices "github.com/opencontainers/runc/libcontainer/devices"
+	"github.com/pkg/errors"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 )
 
@@ -30,6 +31,8 @@ var (
 		"trace": lxc.TRACE,
 		"warn":  lxc.WARN,
 	}
+
+	portForwarderHookPath = "/etc/lxc/lxc-expose-port"
 )
 
 const (
@@ -73,7 +76,7 @@ func (d *Driver) initializeContainer(cfg *drivers.TaskConfig, taskConfig TaskCon
 	return c, nil
 }
 
-func (d *Driver) configureContainerNetwork(c *lxc.Container, taskConfig TaskConfig) error {
+func (d *Driver) configureContainerNetwork(c *lxc.Container, task *drivers.TaskConfig, taskConfig TaskConfig) (*drivers.DriverNetwork, error) {
 
 	// use task specific network mode
 	mode := taskConfig.NetworkMode
@@ -88,20 +91,68 @@ func (d *Driver) configureContainerNetwork(c *lxc.Container, taskConfig TaskConf
 	if mode == "host" {
 		// Set the network type to none for shared "host" networking
 		if err := c.SetConfigItem(lxcKeyPrefix+"type", "none"); err != nil {
-			return fmt.Errorf("error setting network type configuration 'none': %v", err)
+			return nil, fmt.Errorf("error setting network type configuration 'none': %v", err)
 		}
 	} else if mode == "bridge" {
 		// Set the network type to veth for attaching to lxc bridge
 		if err := c.SetConfigItem(lxcKeyPrefix+"type", "veth"); err != nil {
-			return fmt.Errorf("error setting network type configuration 'veth': %v", err)
+			return nil, fmt.Errorf("error setting network type configuration 'veth': %v", err)
 		}
 		if err := c.SetConfigItem(lxcKeyPrefix+"link", "lxcbr0"); err != nil {
-			return fmt.Errorf("error setting network link configuration: %v", err)
+			return nil, fmt.Errorf("error setting network link configuration: %v", err)
 		}
+
+		var network = &drivers.DriverNetwork{
+			PortMap: taskConfig.PortMap,
+		}
+
+		if len(taskConfig.PortMap) > 0 {
+			// TODO: need to refactor this, couldn't find a better way to do this atm
+
+			// if not exists the expose-port fails
+			if err := os.MkdirAll("/var/run/lxc-expose-port", os.ModeDir); err != nil {
+				return nil, err
+			}
+
+			if _, err := os.Stat(portForwarderHookPath); err != nil {
+				if os.IsNotExist(err) {
+					return nil, fmt.Errorf("Missing Port forward hook script")
+				}
+				return nil, errors.Wrap(err, "port expose")
+			}
+
+			var portMap []string
+			for _, port := range taskConfig.PortMap {
+				nodeAddr, err := GetFreeIPPort()
+				if err != nil {
+					return nil, errors.Wrap(err, "querying for free port")
+				}
+				if err != nil {
+					portMap = append(portMap, fmt.Sprintf("%d:%d", nodeAddr.Port, port))
+				}
+				network.IP = nodeAddr.IP.String()
+			}
+
+			if len(portMap) > 0 {
+				upkey := fmt.Sprintf("%s %s", portForwarderHookPath, strings.Join(portMap, " "))
+				if err := c.SetConfigItem(lxcKeyPrefix+"script.up", upkey); err != nil {
+					return nil, err
+				}
+
+				if err := c.SetConfigItem(lxcKeyPrefix+"script.down", portForwarderHookPath); err != nil {
+					return nil, err
+				}
+
+				// ensure that PortMap variables are populated early on
+				task.Env = taskenv.SetPortMapEnvs(task.Env, taskConfig.PortMap)
+			}
+		}
+		network.AutoAdvertise = true
+		return network, nil
 	} else {
-		return fmt.Errorf("Network mode is undefined")
+		return nil, fmt.Errorf("Network mode is undefined")
 	}
-	return nil
+	return nil, nil
 }
 
 func networkTypeConfigPrefix() string {
