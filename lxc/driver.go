@@ -3,9 +3,12 @@ package lxc
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/hashicorp/consul-template/signals"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
@@ -51,6 +54,11 @@ var (
 		SendSignals: true,
 		Exec:        false,
 		FSIsolation: drivers.FSIsolationImage,
+		NetIsolationModes: []drivers.NetIsolationMode{
+			drivers.NetIsolationModeGroup,
+			drivers.NetIsolationModeHost,
+			drivers.NetIsolationModeTask,
+		},
 	}
 )
 
@@ -161,6 +169,7 @@ type TaskState struct {
 	TaskConfig    *drivers.TaskConfig
 	ContainerName string
 	StartedAt     time.Time
+	Net           *drivers.DriverNetwork
 }
 
 // NewLXCDriver returns a new DriverPlugin implementation
@@ -357,6 +366,12 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		command = append(command, driverConfig.Args...)
 	}
 
+	dumpConfigPath := filepath.Join(cfg.TaskDir().Dir, fmt.Sprintf("%s-lxc.conf", cfg.Name))
+	if err := c.SaveConfigFile(dumpConfigPath); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
 	if AttachmentMode {
 		if err := c.Start(); err != nil {
 			cleanup()
@@ -402,6 +417,7 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		ContainerName: containerID,
 		TaskConfig:    cfg,
 		StartedAt:     h.startedAt,
+		Net:           network,
 	}
 
 	h.waitForNetwork()
@@ -527,7 +543,30 @@ func (d *Driver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, err
 }
 
 func (d *Driver) SignalTask(taskID string, signal string) error {
-	return fmt.Errorf("LXC driver does not support signal")
+	h, ok := d.tasks.Get(taskID)
+	if !ok {
+		return drivers.ErrTaskNotFound
+	}
+
+	sig, err := signals.Parse(signal)
+	if err != nil {
+		return fmt.Errorf("failed to parse signal: %v", err)
+	}
+
+	h.logger.Info(fmt.Sprintf("Recieved signal %s", signal))
+
+	// https://linuxcontainers.org/lxc/manpages/man5/lxc.container.conf.5.html
+	switch sig {
+	case syscall.SIGPWR, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL:
+		return h.container.Stop()
+	case syscall.SIGUSR2:
+		if err := h.container.Shutdown(time.Second); err != nil {
+			return h.container.Stop()
+		}
+		return nil
+	default:
+		return fmt.Errorf("Unsupported signal %v", sig)
+	}
 }
 
 func (d *Driver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {

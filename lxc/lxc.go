@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/client/taskenv"
+	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	ldevices "github.com/opencontainers/runc/libcontainer/devices"
 	"github.com/pkg/errors"
@@ -77,7 +78,6 @@ func (d *Driver) initializeContainer(cfg *drivers.TaskConfig, taskConfig TaskCon
 }
 
 func (d *Driver) configureContainerNetwork(c *lxc.Container, task *drivers.TaskConfig, taskConfig TaskConfig) (*drivers.DriverNetwork, error) {
-
 	// use task specific network mode
 	mode := taskConfig.NetworkMode
 	if mode == "" {
@@ -107,7 +107,16 @@ func (d *Driver) configureContainerNetwork(c *lxc.Container, task *drivers.TaskC
 		}
 
 		if len(taskConfig.PortMap) > 0 {
-			// TODO: need to refactor this, couldn't find a better way to do this atm
+			if len(task.Resources.NomadResources.Networks) == 0 {
+				return nil, fmt.Errorf("Trying to map ports but no network interface is available")
+			}
+
+			if len(task.Resources.NomadResources.Networks) > 1 {
+				return nil, fmt.Errorf("driver doesn't support multiple networks")
+			}
+
+			// TODO add support for more than one network
+			allocated := task.Resources.NomadResources.Networks[0]
 
 			// if not exists the expose-port fails
 			if err := os.MkdirAll("/var/run/lxc-expose-port", os.ModeDir); err != nil {
@@ -121,20 +130,30 @@ func (d *Driver) configureContainerNetwork(c *lxc.Container, task *drivers.TaskC
 				return nil, errors.Wrap(err, "port expose")
 			}
 
-			var portMap []string
-			for _, port := range taskConfig.PortMap {
-				nodeAddr, err := GetFreeIPPort()
-				if err != nil {
-					return nil, errors.Wrap(err, "querying for free port")
+			allPorts := []structs.Port{}
+			allPorts = append(allPorts, allocated.ReservedPorts...)
+			allPorts = append(allPorts, allocated.DynamicPorts...)
+
+			var publisedPorts []string
+			for _, port := range allPorts {
+				// By default we will map the allocated port 1:1 to the container
+				containerPortInt := port.Value
+
+				// If the user has mapped a port using port_map we'll change it here
+				if mapped, ok := taskConfig.PortMap[port.Label]; ok {
+					containerPortInt = mapped
 				}
-				if err != nil {
-					portMap = append(portMap, fmt.Sprintf("%d:%d", nodeAddr.Port, port))
-				}
-				network.IP = nodeAddr.IP.String()
+				hostPortStr := port.Value
+				containerPort := containerPortInt
+				d.logger.Debug("exposed port", "port", containerPort)
+
+				publisedPorts = append(publisedPorts, fmt.Sprintf("%d:%d", hostPortStr, containerPort))
 			}
 
-			if len(portMap) > 0 {
-				upkey := fmt.Sprintf("%s %s", portForwarderHookPath, strings.Join(portMap, " "))
+			if len(publisedPorts) > 0 {
+				publised := strings.Join(publisedPorts, " ")
+				d.logger.Info(fmt.Sprintf("Exposing ports %v ...", publised), "container", c.Name())
+				upkey := fmt.Sprintf("%s %s", portForwarderHookPath, publised)
 				if err := c.SetConfigItem(lxcKeyPrefix+"script.up", upkey); err != nil {
 					return nil, err
 				}
@@ -146,8 +165,10 @@ func (d *Driver) configureContainerNetwork(c *lxc.Container, task *drivers.TaskC
 				// ensure that PortMap variables are populated early on
 				task.Env = taskenv.SetPortMapEnvs(task.Env, taskConfig.PortMap)
 			}
+
+			network.IP = allocated.IP
+			network.AutoAdvertise = true
 		}
-		network.AutoAdvertise = true
 		return network, nil
 	} else {
 		return nil, fmt.Errorf("Network mode is undefined")
