@@ -185,6 +185,10 @@ func networkTypeConfigPrefix() string {
 	return "lxc.network."
 }
 
+func (d *Driver) configureBackend(c *lxc.Container, cfg BackingStoreConfig) error {
+
+}
+
 func (d *Driver) mountVolumes(c *lxc.Container, cfg *drivers.TaskConfig, taskConfig TaskConfig) error {
 	mounts, err := d.mountEntries(cfg, taskConfig)
 	if err != nil {
@@ -321,7 +325,7 @@ func (d *Driver) setResourceLimits(c *lxc.Container, cfg *drivers.TaskConfig) er
 }
 
 func toLXCCreateOptions(taskConfig TaskConfig) lxc.TemplateOptions {
-	return lxc.TemplateOptions{
+	options := lxc.TemplateOptions{
 		Template:             taskConfig.Template,
 		Distro:               taskConfig.Distro,
 		Release:              taskConfig.Release,
@@ -330,6 +334,14 @@ func toLXCCreateOptions(taskConfig TaskConfig) lxc.TemplateOptions {
 		DisableGPGValidation: taskConfig.DisableGPGValidation,
 		ExtraArgs:            taskConfig.TemplateArgs,
 	}
+
+	// missing in upstream: https://github.com/lxc/go-lxc/issues/43
+	// https://github.com/lxc/go-lxc/pull/7
+	var bk = new(lxc.BackendStore)
+	bk.Set(taskConfig.BackingStore.Mode)
+
+	options.Backend = bk
+	return options
 }
 
 // waitTillStopped blocks and returns true when container stops;

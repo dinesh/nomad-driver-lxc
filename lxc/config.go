@@ -22,6 +22,31 @@ var (
 		),
 	})
 
+	backingstoreBlock = hclspec.NewObject(map[string]*hclspec.Spec{
+		"mode": hclspec.NewDefault(
+			hclspec.NewAttr("mode", "string", true),
+			hclspec.NewAttr("\"dir\""),
+		),
+		"zfs": hclspec.NewBlock("zfs", false, hclspec.NewObject(map[string]*hclspec.Spec{
+			"root": hclspec.NewDefault(
+				hclspec.NewAttr("root", "string", true),
+				hclspec.NewLiteral("\"tank/lxc\""),
+			),
+		})),
+		"lvm": hclspec.NewBlock("lvm", false, hclspec.NewObject(map[string]*hclspec.Spec{
+			"lvname":   hclspec.NewAttr("lvname", "string", false),
+			"vgname":   hclspec.NewAttr("vgname", "string", false),
+			"thinpool": hclspec.NewAttr("thinpool", "string", false),
+		})),
+		"rbd": hclspec.NewObject("rbd", false, hclspec.NewObject(map[string]*hclspec.Spec{
+			"name": hclspec.NewAttr("name", "string", true),
+			"pool": hclspec.NewAttr("pool", "string", true),
+		})),
+		"fstype": hclspec.NewAttr("fstype", "string", false),
+		"fssize": hclspec.NewAttr("fssize", "string", false),
+		"dir":    hclspec.NewAttr("dir", "string", false),
+	})
+
 	// configSpec is the hcl specification returned by the ConfigSchema RPC
 	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		"enabled": hclspec.NewDefault(
@@ -86,5 +111,6 @@ var (
 		"parameters":     hclspec.NewAttr("parameters", "list(string)", false),
 		"command":        hclspec.NewAttr("command", "string", false),
 		"args":           hclspec.NewAttr("args", "list(string)", false),
+		"bdev":           backingstoreBlock,
 	})
 )

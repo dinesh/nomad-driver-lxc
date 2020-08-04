@@ -140,26 +140,47 @@ type Config struct {
 
 // TaskConfig is the driver configuration of a task within a job
 type TaskConfig struct {
-	Template             string             `codec:"template"`
-	Distro               string             `codec:"distro"`
-	Release              string             `codec:"release"`
-	Arch                 string             `codec:"arch"`
-	ImageVariant         string             `codec:"image_variant"`
-	ImageServer          string             `codec:"image_server"`
-	GPGKeyID             string             `codec:"gpg_key_id"`
-	GPGKeyServer         string             `codec:"gpg_key_server"`
-	DisableGPGValidation bool               `codec:"disable_gpg"`
-	FlushCache           bool               `codec:"flush_cache"`
-	ForceCache           bool               `codec:"force_cache"`
-	TemplateArgs         []string           `codec:"template_args"`
-	LogLevel             string             `codec:"log_level"`
-	Verbosity            string             `codec:"verbosity"`
-	Volumes              []string           `codec:"volumes"`
-	NetworkMode          string             `codec:"network_mode"`
-	PortMap              hclutils.MapStrInt `codec:"port_map"`
-	Parameters           []string           `codec:"parameters"`
-	Command              string             `codec:"command"`
-	Args                 []string           `codec:"args"`
+	Template             string              `codec:"template"`
+	Distro               string              `codec:"distro"`
+	Release              string              `codec:"release"`
+	Arch                 string              `codec:"arch"`
+	ImageVariant         string              `codec:"image_variant"`
+	ImageServer          string              `codec:"image_server"`
+	GPGKeyID             string              `codec:"gpg_key_id"`
+	GPGKeyServer         string              `codec:"gpg_key_server"`
+	DisableGPGValidation bool                `codec:"disable_gpg"`
+	FlushCache           bool                `codec:"flush_cache"`
+	ForceCache           bool                `codec:"force_cache"`
+	TemplateArgs         []string            `codec:"template_args"`
+	LogLevel             string              `codec:"log_level"`
+	Verbosity            string              `codec:"verbosity"`
+	Volumes              []string            `codec:"volumes"`
+	NetworkMode          string              `codec:"network_mode"`
+	PortMap              hclutils.MapStrInt  `codec:"port_map"`
+	Parameters           []string            `codec:"parameters"`
+	Command              string              `codec:"command"`
+	Args                 []string            `codec:"args"`
+	BackingStore         *BackingStoreConfig `code:"backingstore"`
+}
+
+// ref https://github.com/lxc/lxc/blob/master/src/lxc/tools/lxc_create.c
+type BackingStoreConfig struct {
+	Mode string `codec:"mode"`
+	Directory string `codec:"dir"`
+	ZFS struct {
+		Root string `codec:"root"`
+	} `codec:"zfs"`
+	LVM struct {
+		LVName   string `codec:"lvname"`
+		ThinPool string `codec:"thinpool"`
+		VGName   string `codec:"vgname"`
+	} `codec:"lvm"`
+	RBD: struct {
+		Name string `codec:"name"`
+		Pool string `codec:"pool"` 
+	} `codec:"rbd"`
+	FSType string `codec:"fstype"`
+	FSSize string `codec:"fssize"`
 }
 
 // TaskState is the state which is encoded in the handle returned in
